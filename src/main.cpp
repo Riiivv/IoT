@@ -3,6 +3,7 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <time.h>
+#include <esp_sleep.h>
 
 #include "secrets.h"
 
@@ -13,6 +14,8 @@ void printFeedbackCounts();
 void connectWiFi();
 void connectMQTT();
 void setupTime();
+void goToDeepSleep();
+void printWakeupReason();
 
 // Secure WiFi client for MQTT TLS connection
 WiFiClientSecure espClient;
@@ -51,91 +54,100 @@ const unsigned long lockTime = 3000;
 // Debounce delay for buttons
 const unsigned long debounceDelay = 50;
 
+// Go to deep sleep after 1 minute without button press
+const unsigned long sleepAfter = 60000;
+
+// Wake automatically after 1 minute
+const uint64_t sleepTimeUs = 60ULL * 1000000ULL;
+
+// Track last button activity
+unsigned long lastActivityTime = 0;
+
+// Wake on any button HIGH
+const uint64_t wakeupButtonMask =
+  (1ULL << 32) |
+  (1ULL << 33) |
+  (1ULL << 25) |
+  (1ULL << 26);
+
 // Prevent multiple button presses during feedback
 bool locked = false;
 
 void setup()
 {
-  // Start Serial Monitor
   Serial.begin(115200);
+  delay(500);
+
+  printWakeupReason();
 
   // Setup LEDs and buttons
   for (int i = 0; i < 4; i++)
   {
-    // LED output
     pinMode(ledPins[i], OUTPUT);
     digitalWrite(ledPins[i], LOW);
 
-    // Button input with pulldown resistor
     pinMode(buttonPins[i], INPUT_PULLDOWN);
   }
 
-  // Run startup LED animation
   startupAnimation();
 
-  // Connect to WiFi
   connectWiFi();
 
-  // Get Danish time from NTP server
   setupTime();
 
-  // Skip certificate validation (temporary solution)
+  // TLS without certificate validation
   espClient.setInsecure();
-
-  // TLS handshake timeout
   espClient.setHandshakeTimeout(30);
 
-  // MQTT broker settings
   client.setServer(MQTT_HOST, MQTT_PORT);
 
-  // Connect to MQTT broker
   connectMQTT();
+
+  lastActivityTime = millis();
 
   Serial.println("Smiley feedback klar");
 }
 
 void loop()
 {
-  // Reconnect MQTT if disconnected
   if (!client.connected())
   {
     connectMQTT();
   }
 
-  // Keep MQTT connection alive
   client.loop();
 
-  // Ignore input while locked
   if (locked) return;
 
-  // Check all buttons
   for (int i = 0; i < 4; i++)
   {
-    // Button pressed
     if (digitalRead(buttonPins[i]) == HIGH)
     {
-      // Debounce delay
       delay(debounceDelay);
 
-      // Confirm button still pressed
       if (digitalRead(buttonPins[i]) == HIGH)
       {
         handleFeedback(i);
       }
     }
   }
+
+  // If no button has been pressed for 1 minute, save power
+  if (millis() - lastActivityTime >= sleepAfter)
+  {
+    goToDeepSleep();
+  }
 }
 
 void setupTime()
 {
-  // UTC+2 for Denmark summer time
+  // UTC+2 for Danish summer time
   configTime(7200, 0, "pool.ntp.org", "time.nist.gov");
 
   Serial.print("Venter på dansk tid");
 
   time_t now = time(nullptr);
 
-  // Wait until valid time is received
   while (now < 100000)
   {
     delay(500);
@@ -150,29 +162,21 @@ void setupTime()
 
 void handleFeedback(int index)
 {
-  // Lock buttons during processing
   locked = true;
+  lastActivityTime = millis();
 
-  // Increase counter
   feedbackCounts[index]++;
 
-  // Print feedback to Serial Monitor
   Serial.print("Tak for din feedback: ");
   Serial.println(feedbackNames[index]);
 
-  // Print all counters
   printFeedbackCounts();
 
-  // Get current time
   time_t now = time(nullptr);
-
-  // Convert time to readable format
   struct tm *timeinfo = localtime(&now);
 
-  // Timestamp buffer
   char timestamp[30];
 
-  // Format timestamp
   strftime(
     timestamp,
     sizeof(timestamp),
@@ -180,21 +184,18 @@ void handleFeedback(int index)
     timeinfo
   );
 
-  // Create JSON message
   String message = "{";
   message += "\"value\":\"" + String(feedbackValues[index]) + "\",";
   message += "\"timestamp\":\"" + String(timestamp) + "\",";
   message += "\"button\":" + String(index + 1);
   message += "}";
 
-  // Publish MQTT message
   bool sent = client.publish(
     "/devices/device05/Button",
     message.c_str(),
     false
   );
 
-  // Print result
   if (sent)
   {
     Serial.println("MQTT JSON sendt!");
@@ -205,30 +206,63 @@ void handleFeedback(int index)
     Serial.println("MQTT besked FEJLEDE!");
   }
 
-  // Turn on selected LED
   digitalWrite(ledPins[index], HIGH);
 
-  // Keep LED on
   delay(lockTime);
 
-  // Turn LED off
   digitalWrite(ledPins[index], LOW);
 
-  // Wait until button released
   while (digitalRead(buttonPins[index]) == HIGH)
   {
     delay(10);
   }
 
-  // Unlock buttons
+  lastActivityTime = millis();
   locked = false;
+}
+
+void goToDeepSleep()
+{
+  Serial.println("Ingen aktivitet i 1 minut.");
+  Serial.println("Går i DeepSleep...");
+
+  client.disconnect();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  delay(500);
+
+  // Wake after 1 minute
+  esp_sleep_enable_timer_wakeup(sleepTimeUs);
+
+  // Wake if any button goes HIGH
+  esp_sleep_enable_ext1_wakeup(wakeupButtonMask, ESP_EXT1_WAKEUP_ANY_HIGH);
+
+  esp_deep_sleep_start();
+}
+
+void printWakeupReason()
+{
+  esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
+
+  if (wakeupReason == ESP_SLEEP_WAKEUP_TIMER)
+  {
+    Serial.println("Vågnet fra DeepSleep: Timer");
+  }
+  else if (wakeupReason == ESP_SLEEP_WAKEUP_EXT1)
+  {
+    Serial.println("Vågnet fra DeepSleep: Knaptryk");
+  }
+  else
+  {
+    Serial.println("Normal start");
+  }
 }
 
 void printFeedbackCounts()
 {
   Serial.println("Feedback status:");
 
-  // Print all counters
   for (int i = 0; i < 4; i++)
   {
     Serial.print(feedbackNames[i]);
@@ -241,7 +275,6 @@ void printFeedbackCounts()
 
 void startupAnimation()
 {
-  // LED sweep animation
   for (int i = 0; i < 4; i++)
   {
     digitalWrite(ledPins[i], HIGH);
@@ -251,7 +284,6 @@ void startupAnimation()
 
   delay(200);
 
-  // Turn all LEDs on
   for (int i = 0; i < 4; i++)
   {
     digitalWrite(ledPins[i], HIGH);
@@ -259,7 +291,6 @@ void startupAnimation()
 
   delay(300);
 
-  // Turn all LEDs off
   for (int i = 0; i < 4; i++)
   {
     digitalWrite(ledPins[i], LOW);
@@ -270,10 +301,8 @@ void connectWiFi()
 {
   Serial.println("Forbinder til WiFi...");
 
-  // Start WiFi connection
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // Wait for connection
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
@@ -283,26 +312,22 @@ void connectWiFi()
   Serial.println();
   Serial.println("WiFi forbundet!");
 
-  // Print IP address
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
 }
 
 void connectMQTT()
 {
-  // Keep trying until connected
   while (!client.connected())
   {
     Serial.println("Forbinder til MQTT...");
 
-    // Connect to broker
     if (client.connect("device05", MQTT_USERNAME, MQTT_PASSWORD))
     {
       Serial.println("MQTT forbundet!");
     }
     else
     {
-      // Print MQTT error
       Serial.print("Fejl: ");
       Serial.println(client.state());
 
